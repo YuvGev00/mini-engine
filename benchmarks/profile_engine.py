@@ -44,7 +44,7 @@ def timed_step(eng: LLMEngine, sync: Any, totals: dict[str, float]) -> None:
         batch = eng.scheduler.schedule()
         t = mark("schedule", t)
         graphs = eng.decode_graphs
-        if graphs and len(batch) <= graphs.max_batch and all(i.num_tokens == 1 and i.samples for i in batch):
+        if graphs and eng._graphs_for(batch, {}) is graphs:
             logits = graphs.run(batch)
             t = mark("model forward (CUDA graph, incl. H2D)", t)
         else:

@@ -22,9 +22,10 @@ Two backends compute the same attention:
   "grouped"  folds each KV head's query group into the query-length axis, so one batched
              matmul per side serves all heads of a group with no K/V expansion. Softmax runs
              in fp32. "sdpa" stays the reference on CPU.
-  "triton"   decode steps (one query per sequence) run a Triton kernel that reads K/V
-             straight from the block cache (see triton_attention.py); other steps use
-             "grouped". The default on CUDA when Triton is installed.
+  "triton"   steps with few new tokens per sequence (decode, speculative verify) run
+             Triton kernels that read K/V straight from the block cache (see
+             triton_attention.py); longer prefill chunks use "grouped". The default on
+             CUDA when Triton is installed.
 """
 
 from __future__ import annotations
@@ -34,6 +35,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+# Steps with at most this many new tokens per sequence use the Triton multi-query kernel
+# under the "triton" backend; longer prefill chunks use the "grouped" PyTorch path.
+MAX_TRITON_QUERIES = 8
+
 
 @dataclass
 class AttentionMetadata:
@@ -41,6 +46,7 @@ class AttentionMetadata:
     key_slots: torch.Tensor  # [B, max_blocks * block_size] int64, cache slot of every key (padding masked)
     block_tables: torch.Tensor  # [B, max_blocks] int64, padded with 0 (used by the Triton decode kernel)
     context_lens: torch.Tensor  # [B] int64, cached plus new tokens per sequence
+    query_lens: torch.Tensor  # [B] int64, new tokens per sequence
     query_index: torch.Tensor  # [T] int64, position of each new token in the [B * max_q] padded layout
     mask: torch.Tensor  # [B, 1, max_q, max_k] bool, True = may attend
     batch_size: int
@@ -86,6 +92,7 @@ class AttentionMetadata:
             key_slots=key_slots,
             block_tables=tables,
             context_lens=ctx_lens,
+            query_lens=q_lens,
             query_index=torch.tensor(query_index, dtype=torch.int64, device=device),
             mask=mask[:, None, :, :],
             batch_size=batch_size,
@@ -118,16 +125,24 @@ def paged_attention(
 
         return paged_decode_attention(q, k_cache, v_cache, meta.block_tables, meta.context_lens)
 
-    # 2. Gather each sequence's full context in one op: [kvh, B, K, d].
-    keys = k_slots[:, meta.key_slots]
-    values = v_slots[:, meta.key_slots]
-
-    # 3. Scatter queries into the padded layout: [T, h, d] -> [B, max_q, h, d].
+    # 2. Scatter queries into the padded layout: [T, h, d] -> [B, max_q, h, d].
     q_pad = q.new_zeros(b * max_q, num_heads, head_dim)
     q_pad[meta.query_index] = q
     q_pad = q_pad.view(b, max_q, num_heads, head_dim)
 
-    if meta.backend == "grouped":
+    if meta.backend == "triton" and max_q <= MAX_TRITON_QUERIES:  # e.g. speculative verify
+        from mini_engine.triton_attention import paged_multi_query_attention
+
+        out = paged_multi_query_attention(
+            q_pad, k_cache, v_cache, meta.block_tables, meta.context_lens, meta.query_lens
+        )
+        return out.reshape(b * max_q, num_heads, head_dim)[meta.query_index]
+
+    # 3. Gather each sequence's full context in one op: [kvh, B, K, d].
+    keys = k_slots[:, meta.key_slots]
+    values = v_slots[:, meta.key_slots]
+
+    if meta.backend in ("grouped", "triton"):  # "triton" falls back to grouped for long chunks
         out = grouped_attention(q_pad, keys, values, meta.mask)  # [B, max_q, h, d]
     else:
         out = F.scaled_dot_product_attention(

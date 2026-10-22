@@ -12,7 +12,7 @@ import torch
 
 from mini_engine.attention import AttentionMetadata
 from mini_engine.block_manager import BlockManager
-from mini_engine.cuda_graphs import DecodeGraphs
+from mini_engine.cuda_graphs import StepGraphs
 from mini_engine.model import ModelConfig, Qwen3ForCausalLM
 from mini_engine.scheduler import ScheduledSeq, Scheduler, SchedulerConfig
 from mini_engine.sequence import SamplingParams, Sequence
@@ -33,7 +33,7 @@ class EngineConfig:
     speculative: SpeculativeConfig | None = None  # n-gram speculative decoding (greedy requests only)
     # "sdpa", "grouped", "triton", or "auto" (triton, else grouped, on CUDA; sdpa elsewhere)
     attention_backend: str = "auto"
-    cuda_graphs: bool = True  # replay captured graphs for decode steps (CUDA + "triton" only)
+    cuda_graphs: bool = True  # replay captured graphs for decode/verify steps (CUDA + "triton")
 
 
 @dataclass
@@ -88,16 +88,24 @@ class LLMEngine:
             raise ValueError(f"unknown attention_backend {config.attention_backend!r}")
         self.attention_backend = backend
         self.stats = EngineStats()
-        self.decode_graphs: DecodeGraphs | None = None
+        self.decode_graphs: StepGraphs | None = None  # one new token per sequence
+        self.verify_graphs: StepGraphs | None = None  # last token + up to k drafts
         if config.cuda_graphs and backend == "triton":
-            self.decode_graphs = DecodeGraphs(
-                self.model,
-                self.kv_caches,
-                max_batch=config.max_num_seqs,
-                max_blocks_per_seq=-(-config.max_model_len // config.block_size),
-                block_size=config.block_size,
-                spare_block=config.num_blocks,
-            )
+
+            def capture(query_len: int) -> StepGraphs:
+                return StepGraphs(
+                    self.model,
+                    self.kv_caches,
+                    max_batch=config.max_num_seqs,
+                    query_len=query_len,
+                    max_blocks_per_seq=-(-config.max_model_len // config.block_size),
+                    block_size=config.block_size,
+                    spare_block=config.num_blocks,
+                )
+
+            self.decode_graphs = capture(1)
+            if config.speculative is not None:
+                self.verify_graphs = capture(config.speculative.num_speculative_tokens + 1)
 
     # ----------------------------------------------------------------- loading
 
@@ -159,14 +167,9 @@ class LLMEngine:
                 del seq.token_ids[-len(draft) :]
                 del drafts[seq_id]
 
-        graphs = self.decode_graphs
-        if (
-            graphs
-            and not drafts
-            and len(batch) <= graphs.max_batch
-            and all(i.num_tokens == 1 and i.samples for i in batch)
-        ):
-            logits = graphs.run(batch)
+        graphs = self._graphs_for(batch, drafts)
+        if graphs is not None:
+            logits = graphs.run(batch, verify=drafts.keys())
         else:
             input_ids, positions, meta, logits_index = self._prepare(batch, drafts)
             logits = self.model(input_ids, positions, self.kv_caches, meta, logits_index)
@@ -221,6 +224,22 @@ class LLMEngine:
             return torch.tensor(xs, dtype=torch.int64, device=self.device)
 
         return as_tensor(input_ids), as_tensor(positions), meta, as_tensor(logits_index)
+
+    def _graphs_for(
+        self, batch: list[ScheduledSeq], drafts: dict[int, tuple[Sequence, list[int]]]
+    ) -> StepGraphs | None:
+        """The captured graphs that can run this step, if any: every sequence is either
+        decoding one token or verifying its drafts (no prefill chunks)."""
+        if self.decode_graphs is None or len(batch) > self.decode_graphs.max_batch:
+            return None
+        if not all(i.seq.seq_id in drafts or (i.num_tokens == 1 and i.samples) for i in batch):
+            return None
+        longest = max(i.num_tokens for i in batch)
+        if longest == 1:
+            return self.decode_graphs
+        if self.verify_graphs is not None and longest <= self.verify_graphs.query_len:
+            return self.verify_graphs
+        return None
 
     def _append_drafts(self) -> dict[int, tuple[Sequence, list[int]]]:
         """Propose n-gram drafts for greedy decoding sequences and append them, so the
