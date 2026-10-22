@@ -74,7 +74,7 @@ def main() -> None:
     n, p_len = (8, 32) if args.model == "tiny" else (64, 256)
     for _ in range(n):
         prompt = [rng.randrange(100, vocab) for _ in range(p_len)]
-        max_tokens = 200 if args.model == "tiny" else 10_000
+        max_tokens = 200  # enough for warm-up + timed + profiled decode steps
         eng.add_request(prompt, SamplingParams(max_tokens=max_tokens, ignore_eos=True))
     while any(s.num_uncomputed_tokens > 1 for s in eng.scheduler.running) or eng.scheduler.waiting:
         eng.step()  # prefill
