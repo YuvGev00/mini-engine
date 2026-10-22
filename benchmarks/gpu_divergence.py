@@ -45,7 +45,7 @@ def main() -> None:
     print(f"DIVERGE HF sdpa vs HF eager fp32: {same}/{len(prompts)} identical, first divergence {div}")
 
     eng = LLMEngine.from_pretrained(MODEL, EngineConfig(device="cuda", dtype=torch.float32, num_blocks=512))
-    ours = eng.generate(prompts, SamplingParams(max_tokens=NEW, ignore_eos=True))
+    ours = eng.generate(prompts, SamplingParams(max_tokens=NEW))
     for i, (p, a, b) in enumerate(zip(prompts, ours, refs["sdpa"], strict=True)):
         d = first_divergence(a, b)
         if d is None:

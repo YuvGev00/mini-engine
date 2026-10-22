@@ -4,6 +4,10 @@ fp32: mini-engine (batched, with and without speculation) must match HF token fo
 bf16: different kernels legitimately flip near-tie argmaxes, so this reports where each
 sequence first diverges instead of asserting equality.
 
+Both sides stop naturally at EOS. (Forcing a length differs between the two: HF's
+`min_new_tokens` *bans* EOS, while `ignore_eos` lets the engine pick EOS and keep going, so
+a forced-length comparison diverges exactly where the model wants to end its answer.)
+
     python benchmarks/gpu_parity.py
 """
 
@@ -30,6 +34,8 @@ NEW = 48
 
 
 def hf_greedy(model, prompts: list[list[int]]) -> list[list[int]]:  # type: ignore[no-untyped-def]
+    eos = model.generation_config.eos_token_id
+    eos_ids = {eos} if isinstance(eos, int) else set(eos or [])
     outs = []
     for p in prompts:
         ids = torch.tensor([p], device="cuda")
@@ -37,18 +43,22 @@ def hf_greedy(model, prompts: list[list[int]]) -> list[list[int]]:  # type: igno
             ids,
             attention_mask=torch.ones_like(ids),
             max_new_tokens=NEW,
-            min_new_tokens=NEW,
             do_sample=False,
             temperature=None,
             top_p=None,
             top_k=None,
         )
-        outs.append(out[0, len(p) :].tolist())
+        toks = out[0, len(p) :].tolist()
+        end = next((i + 1 for i, t in enumerate(toks) if t in eos_ids), len(toks))
+        outs.append(toks[:end])  # HF pads after EOS; the engine stops at it
     return outs
 
 
 def first_divergence(a: list[int], b: list[int]) -> int | None:
-    return next((i for i, (x, y) in enumerate(zip(a, b, strict=True)) if x != y), None)
+    diff = next((i for i, (x, y) in enumerate(zip(a, b, strict=False)) if x != y), None)
+    if diff is None and len(a) != len(b):
+        return min(len(a), len(b))
+    return diff
 
 
 def main() -> None:
@@ -59,7 +69,7 @@ def main() -> None:
             [{"role": "user", "content": q}], add_generation_prompt=True, tokenize=True, enable_thinking=False
         )
         prompts.append(list(enc["input_ids"] if hasattr(enc, "keys") else enc))
-    params = SamplingParams(max_tokens=NEW, ignore_eos=True)
+    params = SamplingParams(max_tokens=NEW)
 
     for dtype in (torch.float32, torch.bfloat16):
         hf = AutoModelForCausalLM.from_pretrained(MODEL, dtype=dtype).to("cuda").eval()
