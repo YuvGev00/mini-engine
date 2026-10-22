@@ -67,9 +67,12 @@ def workloads(tokenizer: Any, vocab: int, small: bool) -> dict[str, dict[str, An
         messages = [
             {"role": "user", "content": f"Repeat the following text exactly, word for word:\n\n{COPY_TEXT}"}
         ]
-        copy_prompt = tokenizer.apply_chat_template(
+        encoded = tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=True, enable_thinking=False
         )
+        # transformers 5 returns a BatchEncoding by default; older versions return a list.
+        copy_prompt = list(encoded["input_ids"] if hasattr(encoded, "keys") else encoded)
+        assert all(isinstance(t, int) for t in copy_prompt)
         copy_out = len(tokenizer(COPY_TEXT).input_ids)
     return {
         "throughput": {"prompts": throughput, "max_tokens": out},
