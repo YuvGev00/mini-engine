@@ -5,7 +5,7 @@
   "dtype": "bfloat16",
   "model": "Qwen/Qwen3-0.6B"
  },
- "note": "perf/decode build (Triton decode kernel + CUDA graphs). outputs_head omitted: copied from the Colab output by hand. v0.1 numbers are in mini_v0.1.json.",
+ "note": "perf/decode build (Triton decode + multi-query kernels, CUDA graphs for decode and speculative verify). outputs_head omitted: copied from the Colab output by hand. v0.1 numbers are in mini_v0.1.json.",
  "rows": [
   {
    "system": "mini",
@@ -14,8 +14,8 @@
    "speculative": false,
    "requests": 64,
    "output_tokens": 8192,
-   "wall_s": 4.564,
-   "output_tok_per_s": 1794.9,
+   "wall_s": 4.132,
+   "output_tok_per_s": 1982.4,
    "steps": 130,
    "cached_prompt_tokens": 0,
    "acceptance_rate": 0.0
@@ -27,8 +27,8 @@
    "speculative": false,
    "requests": 64,
    "output_tokens": 4096,
-   "wall_s": 12.13,
-   "output_tok_per_s": 337.7,
+   "wall_s": 11.078,
+   "output_tok_per_s": 369.8,
    "steps": 192,
    "cached_prompt_tokens": 0,
    "acceptance_rate": 0.0
@@ -40,8 +40,8 @@
    "speculative": false,
    "requests": 64,
    "output_tokens": 4096,
-   "wall_s": 2.681,
-   "output_tok_per_s": 1527.9,
+   "wall_s": 2.422,
+   "output_tok_per_s": 1691.0,
    "steps": 128,
    "cached_prompt_tokens": 32256,
    "acceptance_rate": 0.0
@@ -53,8 +53,8 @@
    "speculative": false,
    "requests": 1,
    "output_tokens": 143,
-   "wall_s": 1.241,
-   "output_tok_per_s": 115.3,
+   "wall_s": 1.26,
+   "output_tok_per_s": 113.5,
    "steps": 143,
    "cached_prompt_tokens": 0,
    "acceptance_rate": 0.0
@@ -66,8 +66,8 @@
    "speculative": true,
    "requests": 1,
    "output_tokens": 143,
-   "wall_s": 1.352,
-   "output_tok_per_s": 105.8,
+   "wall_s": 0.295,
+   "output_tok_per_s": 484.2,
    "steps": 30,
    "cached_prompt_tokens": 0,
    "acceptance_rate": 1.0
@@ -80,7 +80,7 @@
    "requests": 8,
    "output_tokens": 1144,
    "wall_s": 1.414,
-   "output_tok_per_s": 808.8,
+   "output_tok_per_s": 809.0,
    "steps": 143,
    "cached_prompt_tokens": 0,
    "acceptance_rate": 0.0
@@ -92,8 +92,8 @@
    "speculative": true,
    "requests": 8,
    "output_tokens": 1144,
-   "wall_s": 1.447,
-   "output_tok_per_s": 790.7,
+   "wall_s": 0.372,
+   "output_tok_per_s": 3074.7,
    "steps": 30,
    "cached_prompt_tokens": 0,
    "acceptance_rate": 1.0

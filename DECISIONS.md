@@ -124,7 +124,7 @@ token first by 3-12 logits. HF `min_new_tokens` *bans* EOS, while `ignore_eos` l
 choose EOS and continue, so the runs split exactly where the model ends its answer. With natural
 EOS stopping, parity is 8/8 in fp32 with and without speculation (`benchmarks/results/gpu_parity.md`).
 
-## 12. CUDA fast path: a Triton decode kernel and CUDA graphs, decode steps only
+## 12. CUDA fast path: Triton kernels and CUDA graphs for decode and verify steps
 Profiling the decode step on an L4 (`benchmarks/profile_engine.py`) showed two walls in turn.
 First, memory: gathering every context into a padded tensor already ran at memory bandwidth,
 then the matmuls read it again. A Triton kernel (`triton_attention.py`) now walks the block
@@ -132,16 +132,23 @@ table itself, one program per (sequence, KV head), with an online softmax, so ea
 reads the cache once and writes nothing. Second, launches: the GPU then finished its work in
 half the step while the CPU issued ~1,600 kernel launches. The decode forward is captured as
 a CUDA graph per batch-size bucket (1, 2, 4, 8, then every 16) at engine start and replayed.
-- *Scope:* only pure decode batches (one new token per sequence). Prefill, chunked prefill and
-  speculative verify steps keep the eager PyTorch path, which also keeps them identical on
-  CPU and GPU.
-- *Padding:* a batch is padded up to its bucket. Padded rows write K/V to one spare cache
+- *Scope:* steps where every sequence has at most 8 new tokens use the kernels: one token
+  (decode) goes to the decode kernel, more (speculative verify, short chunks) to a
+  multi-query kernel that puts [query tokens x group heads] on the rows of a `tl.dot`, with
+  a causal mask inside the new tokens. Two graph sets are captured: query length 1, and
+  k + 1 when speculation is on, with tokens laid out padded so one graph fits any mix of
+  draft lengths. Longer prefill chunks stay on the eager grouped path. Before the verify
+  graphs existed, speculation was slower than graph-replayed plain decoding, which is the
+  reason the second set exists.
+- *Padding:* a batch is padded up to its bucket. Padded rows and tokens write K/V to one spare cache
   block that the block manager never hands out, attend only to that slot, and are dropped.
 - *A bug worth remembering:* a graph records raw addresses. The first version kept one input
   (`logits_index`) in a local variable; after capture its memory was reused and replays read
   garbage indices (a device-side assert). Every tensor a graph reads now lives on the object.
-- *Tests:* the kernel is compared with the PyTorch path in fp32 and bf16, and graph decode
-  with eager decode token for token (`tests/test_gpu.py`, skipped without CUDA). End to end,
+- *Tests:* both kernels are compared with the PyTorch path in fp32 and bf16, and graph
+  decoding (plain and speculative) with eager decoding token for token (`tests/test_gpu.py`,
+  skipped without CUDA). `tests/test_step_graphs.py` runs the same graph bookkeeping on CPU
+  in CI, with capture faked and the kernels replaced by a dense reference. End to end,
   `gpu_parity.py` still gives 8/8 against HF in fp32.
 
 ## Not in scope (yet)
