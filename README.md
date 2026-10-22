@@ -2,17 +2,20 @@
 
 A small LLM inference engine written from scratch in PyTorch: a paged KV cache,
 continuous batching with preemption, chunked prefill, prefix caching and n-gram
-speculative decoding. It runs
+speculative decoding, plus a CUDA fast path (a Triton paged-decode kernel and CUDA graphs).
+It runs
 Qwen3 (tested on Qwen3-0.6B), and its greedy output is **token-identical to Hugging Face
 `generate`**, both one request at a time and batched.
 
-The core is about 1,000 lines in `src/mini_engine/`, small enough to read in one sitting.
+The core is about 1,300 lines in `src/mini_engine/`, small enough to read in one sitting.
 
 ```
 sequence.py       request state: tokens, num_computed_tokens, block table
 block_manager.py  block allocator, ref counts, chained block hashes, LRU eviction (pure Python)
 scheduler.py      continuous batching under a token budget; FCFS; recompute preemption
-attention.py      paged attention: scatter K/V into blocks, gather via block tables, one SDPA call
+attention.py      paged attention: scatter K/V into blocks, gather via block tables, one masked call
+triton_attention.py  CUDA decode kernel: reads K/V from the block cache in place (Triton)
+cuda_graphs.py    decode forward captured once per batch-size bucket, then replayed
 model.py          Qwen3 decoder over a packed batch (HF-compatible parameter names)
 engine.py         schedule -> prepare tensors -> forward -> sample -> postprocess
 speculative.py    n-gram (prompt lookup) drafts and greedy verification
@@ -44,8 +47,10 @@ outputs = engine.generate([[...token ids...], [...]], SamplingParams(max_tokens=
 2. **Prepare.** Every scheduled token is packed into one flat batch with its position and
    the cache slot its K/V will be written to.
 3. **Forward.** Each layer writes the new K/V into the block cache, gathers each sequence's
-   context through its block table, and runs one masked SDPA call over the padded batch.
-   Prefill and decode share this path, so they can sit in the same batch.
+   context through its block table, and runs one masked attention call over the padded
+   batch. Prefill and decode share this path, so they can sit in the same batch. On CUDA,
+   pure decode steps take a fast path instead: a Triton kernel walks the block tables
+   directly, and the whole forward is replayed from a captured CUDA graph.
 4. **Postprocess.** `num_computed_tokens` advances, newly full blocks get hashed into the
    prefix cache, sampled tokens are appended, and finished sequences free their blocks.
 
@@ -67,27 +72,36 @@ mini-engine and vLLM 0.32.0, each in its own process, greedy, on a Colab L4
 (`benchmarks/colab_bench.ipynb`; raw results in [`benchmarks/results/`](benchmarks/results/)).
 Output tokens per second, higher is better:
 
-| Workload | HF generate | mini-engine | vLLM |
-|---|---|---|---|
-| Throughput: 64 requests × (256 in, 128 out) | 1,292 | 294 | 3,256 |
-| Shared prefix: 64 × (512 shared + 32 in, 64 out), cache warm | 484 | 167 | 3,168 |
-| Copy task, 1 request (speculation off → on) | 26 | 21 → **100** | 171 → 135 |
-| Copy task, 8 requests (speculation off → on) | 205 | 166 → **750** | 1,228 → 4,029 |
+| Workload | HF generate | mini-engine v0.1 | mini-engine now | vLLM |
+|---|---|---|---|---|
+| Throughput: 64 requests × (256 in, 128 out) | 1,292 | 294 | **1,795** | 3,256 |
+| Shared prefix: 64 × (512 shared + 32 in, 64 out), cache warm | 484 | 167 | **1,528** | 3,168 |
+| Copy task, 1 request (speculation off → on) | 26 | 21 → 100 | 115 → 106 | 171 → 135 |
+| Copy task, 8 requests (speculation off → on) | 205 | 166 → 750 | 809 → 791 | 1,228 → 4,029 |
 
-- **Speculative decoding works as designed:** 4.7× faster on the copy task (one request) and
-  4.5× with 8 requests, with every draft accepted. On copy-heavy work, mini-engine with
-  speculation outruns HF `generate` 3.7×. On ordinary chat prompts acceptance is 12-13%
-  (`results/gpu_parity.md`), so the gain there is small.
-- **Prefix caching:** 1.40× on the shared-prefix workload (32,256 prompt tokens served from
-  the cache), against 2.21× for vLLM.
-- **Raw throughput is the cost of the design.** mini-engine is 4.4× slower than HF and
-  11× slower than vLLM on plain batched decoding. Each step gathers every sequence's whole
-  context out of the block cache and runs a masked, padded SDPA call, with Python
-  bookkeeping per step and no custom kernels or CUDA graphs ([DECISIONS #1](DECISIONS.md)).
-  That choice keeps one code path that runs on a Mac and is easy to verify. Closing the gap
-  needs a paged attention kernel (FlashInfer or a Triton decode kernel) and CUDA graphs.
+- **6.1× faster than v0.1 on batched decoding, and now 1.4× faster than HF `generate`**
+  (55% of vLLM). On the decode-only profile (`benchmarks/profile_engine.py`, 64 sequences)
+  a step went from 183 ms to 19 ms (349 → 3,364 tokens/s), in four measured steps:
+
+  | Change | ms/step | What the profiler showed |
+  |---|---|---|
+  | v0.1: gather + SDPA | 183 | SDPA with a bool mask and GQA falls back to its math path and copies K/V per head |
+  | grouped GQA matmuls | 60 | half the GPU time now copies the gathered context into a transposed layout |
+  | head-major KV cache | 46 | the gather itself is at memory bandwidth: 44% of GPU time |
+  | Triton paged-decode kernel | 38 | the GPU is busy only ~18 ms; the CPU launches ~1,600 kernels per step |
+  | CUDA graphs for decode | **19** | step time ≈ GPU work |
+
+- **Speculative decoding no longer pays off on the GPU.** A plain decode step now replays a
+  CUDA graph (8.7 ms at batch 1), but a verify step carries several query tokens per
+  sequence, so it still runs eagerly through the PyTorch attention path (about 45 ms). Four
+  accepted drafts per step no longer cover that gap. The fix is a multi-query variant of the
+  decode kernel plus graphs for verify steps (roadmap).
+- **Prefix caching:** 4.5× on the shared-prefix workload (32,256 prompt tokens served from
+  the cache), against 2.21× for vLLM. Part of that is the cold run being slow: prefill still
+  uses the padded PyTorch path.
 - **Correctness on the GPU:** greedy output is token-identical to HF on 8/8 chat prompts in
-  fp32, with and without speculation. In bf16, 5/8 match, because different kernels
+  fp32, with and without speculation, with the Triton kernel and CUDA graphs on. In bf16,
+  4-5/8 match, because different kernels
   legitimately flip near-tie argmaxes. Details, and a comparison bug that a diagnosis script
   caught, are in [`benchmarks/results/gpu_parity.md`](benchmarks/results/gpu_parity.md).
 
@@ -99,9 +113,12 @@ Output tokens per second, higher is better:
 | `test_scheduler.py` | mixed prefill+decode batches, token-budget chunking, FCFS without queue jumping, preempting the newest, prefix-cache hit on re-admission, EOS |
 | `test_attention.py` | paged attention vs a dense causal reference on scattered block tables (prefill, decode and chunk continuation in one batch) |
 | `test_speculative.py` | n-gram proposer and greedy verifier; output identical to HF unbatched, batched, with a 3-token budget (verification cut short), under preemption and with EOS / max_tokens cutting accepted drafts; fewer steps per sequence; sampled requests not speculated; blocks released |
+| `test_grouped_backend.py` | the grouped-GQA attention backend keeps greedy parity with HF (batched, chunked, preempted, speculative) |
+| `test_gpu.py` | CUDA only: the Triton decode kernel against the PyTorch path (fp32, bf16, unaligned and multi-tile contexts); CUDA-graph decode token-identical to eager decode, including padded batch buckets |
 | `test_parity.py` | logits match HF to 1e-4; greedy tokens match HF unbatched, batched, with prefix hits, under preemption and with 7-token chunked prefill; real Qwen3-0.6B (opt-in) |
 
-CI runs ruff, `mypy --strict` and the tests on CPU-only torch. It downloads no model.
+CI runs ruff, `mypy --strict` and the tests on CPU-only torch. It downloads no model. The
+GPU tests run on a Colab L4 (`benchmarks/colab_profile.ipynb`).
 
 ## Credit
 
@@ -112,9 +129,11 @@ caching and recompute preemption. The code was written independently. See
 
 ## Roadmap
 
-Done: M4 (the correct, tested core) and M5 (n-gram speculative decoding, the GPU benchmark
-against HF and vLLM, and GPU parity). Next:
-- a paged decode-attention kernel and CUDA graphs, to close the throughput gap;
+Done: M4 (the correct, tested core), M5 (n-gram speculative decoding, the GPU benchmark
+against HF and vLLM, and GPU parity) and the decode fast path (Triton kernel, CUDA graphs).
+Next:
+- a multi-query decode kernel and CUDA graphs for speculative verify steps;
+- a paged prefill kernel (prefill still pads and gathers);
 - draft-model speculative decoding (e.g. Qwen3-0.6B drafting for Qwen3-4B);
 - an OpenAI-compatible HTTP server with streaming;
 - a prefix-cache retention study on real agent traces (cf. vLLM RFC #37003).
