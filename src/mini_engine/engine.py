@@ -12,6 +12,7 @@ import torch
 
 from mini_engine.attention import AttentionMetadata
 from mini_engine.block_manager import BlockManager
+from mini_engine.cuda_graphs import DecodeGraphs
 from mini_engine.model import ModelConfig, Qwen3ForCausalLM
 from mini_engine.scheduler import ScheduledSeq, Scheduler, SchedulerConfig
 from mini_engine.sequence import SamplingParams, Sequence
@@ -30,9 +31,9 @@ class EngineConfig:
     dtype: torch.dtype = torch.float32
     seed: int = 0
     speculative: SpeculativeConfig | None = None  # n-gram speculative decoding (greedy requests only)
-    attention_backend: str = (
-        "auto"  # "sdpa", "grouped", "triton", or "auto" (triton/grouped on CUDA, else sdpa)
-    )
+    # "sdpa", "grouped", "triton", or "auto" (triton, else grouped, on CUDA; sdpa elsewhere)
+    attention_backend: str = "auto"
+    cuda_graphs: bool = True  # replay captured graphs for decode steps (CUDA + "triton" only)
 
 
 @dataclass
@@ -67,7 +68,8 @@ class LLMEngine:
             self.block_manager,
             set(eos_token_ids),
         )
-        shape = (mcfg.num_kv_heads, config.num_blocks, config.block_size, mcfg.head_dim)
+        # One spare block past the block manager's range: CUDA-graph padding rows write there.
+        shape = (mcfg.num_kv_heads, config.num_blocks + 1, config.block_size, mcfg.head_dim)
         self.kv_caches = [
             (
                 torch.zeros(shape, dtype=config.dtype, device=self.device),
@@ -86,6 +88,16 @@ class LLMEngine:
             raise ValueError(f"unknown attention_backend {config.attention_backend!r}")
         self.attention_backend = backend
         self.stats = EngineStats()
+        self.decode_graphs: DecodeGraphs | None = None
+        if config.cuda_graphs and backend == "triton":
+            self.decode_graphs = DecodeGraphs(
+                self.model,
+                self.kv_caches,
+                max_batch=config.max_num_seqs,
+                max_blocks_per_seq=-(-config.max_model_len // config.block_size),
+                block_size=config.block_size,
+                spare_block=config.num_blocks,
+            )
 
     # ----------------------------------------------------------------- loading
 
@@ -147,8 +159,17 @@ class LLMEngine:
                 del seq.token_ids[-len(draft) :]
                 del drafts[seq_id]
 
-        input_ids, positions, meta, logits_index = self._prepare(batch, drafts)
-        logits = self.model(input_ids, positions, self.kv_caches, meta, logits_index)
+        graphs = self.decode_graphs
+        if (
+            graphs
+            and not drafts
+            and len(batch) <= graphs.max_batch
+            and all(i.num_tokens == 1 and i.samples for i in batch)
+        ):
+            logits = graphs.run(batch)
+        else:
+            input_ids, positions, meta, logits_index = self._prepare(batch, drafts)
+            logits = self.model(input_ids, positions, self.kv_caches, meta, logits_index)
 
         plain = [item for item in batch if item.seq.seq_id not in drafts]
         rows = iter(range(logits.shape[0]))

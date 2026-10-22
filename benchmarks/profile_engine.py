@@ -43,10 +43,15 @@ def timed_step(eng: LLMEngine, sync: Any, totals: dict[str, float]) -> None:
     with torch.inference_mode():
         batch = eng.scheduler.schedule()
         t = mark("schedule", t)
-        input_ids, positions, meta, logits_index = eng._prepare(batch)
-        t = mark("prepare (metadata + H2D)", t)
-        logits = eng.model(input_ids, positions, eng.kv_caches, meta, logits_index)
-        t = mark("model forward", t)
+        graphs = eng.decode_graphs
+        if graphs and len(batch) <= graphs.max_batch and all(i.num_tokens == 1 and i.samples for i in batch):
+            logits = graphs.run(batch)
+            t = mark("model forward (CUDA graph, incl. H2D)", t)
+        else:
+            input_ids, positions, meta, logits_index = eng._prepare(batch)
+            t = mark("prepare (metadata + H2D)", t)
+            logits = eng.model(input_ids, positions, eng.kv_caches, meta, logits_index)
+            t = mark("model forward", t)
         sampled = eng._sample(logits, [i for i in batch if i.samples]).tolist()
         it = iter(sampled)
         eng.scheduler.postprocess(batch, [next(it) if i.samples else None for i in batch])
