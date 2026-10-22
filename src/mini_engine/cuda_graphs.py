@@ -46,8 +46,10 @@ class DecodeGraphs:
         self.slot_mapping = torch.full((n,), spare_block * block_size, dtype=torch.int64, device=dev)
         self.block_tables = torch.full((n, max_blocks_per_seq), spare_block, dtype=torch.int64, device=dev)
         self.context_lens = torch.ones(n, dtype=torch.int64, device=dev)
-        logits_index = torch.arange(n, device=dev)
-        empty = torch.empty(0, device=dev)
+        # Graphs record raw addresses: every tensor a graph reads must stay alive on self,
+        # or the caching allocator hands its memory to someone else after capture.
+        self.logits_index = torch.arange(n, device=dev)
+        self.empty = torch.empty(0, device=dev)
 
         self.buckets = batch_buckets(max_batch)
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -57,16 +59,16 @@ class DecodeGraphs:
             for b in reversed(self.buckets):  # largest first, so smaller graphs fit in its memory pool
                 meta = AttentionMetadata(
                     slot_mapping=self.slot_mapping[:b],
-                    key_slots=empty,
+                    key_slots=self.empty,
                     block_tables=self.block_tables[:b],
                     context_lens=self.context_lens[:b],
-                    query_index=empty,
-                    mask=empty,
+                    query_index=self.empty,
+                    mask=self.empty,
                     batch_size=b,
                     max_q=1,
                     backend="triton",
                 )
-                args = (self.input_ids[:b], self.positions[:b], kv_caches, meta, logits_index[:b])
+                args = (self.input_ids[:b], self.positions[:b], kv_caches, meta, self.logits_index[:b])
                 model(*args)  # warm-up outside capture: compiles the Triton kernel, sets up cuBLAS
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
