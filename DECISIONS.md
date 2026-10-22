@@ -82,6 +82,42 @@ nano-vllm sizes the KV cache by profiling free GPU memory. Here `num_blocks` is 
 value (`kv_cache_bytes_per_token()` helps pick it). That is easier to reason about in
 tests, and memory profiling on MPS is unreliable anyway. M5 adds profiling for CUDA.
 
+## 9. Speculative decoding: n-gram drafts through the normal scheduler
+- **Drafts are just uncomputed tokens.** They are appended to `token_ids` before `schedule()`,
+  so the scheduler allocates blocks for them and the attention path computes them like a
+  prefill chunk. The only special cases are in the engine: logits are read at every computed
+  position, and drafts are stripped from sequences that were not scheduled (preempted or out
+  of budget) before anything else sees them.
+- **Rollback is a counter.** After verification, `num_computed_tokens` is set to the real
+  last token plus the accepted drafts that were computed; rejected drafts' K/V stays in the
+  cache and is overwritten later. Blocks are only hashed up to `num_computed_tokens`, so the
+  prefix cache never registers a rejected draft.
+- **A cut-short chunk still works.** If the token budget computes only part of the drafts,
+  the accepted prefix is limited to what was computed, and the step yields no bonus token.
+- **Greedy only.** Sampled requests skip speculation: exact speculative *sampling* needs
+  rejection sampling against draft probabilities, which an n-gram proposer does not have.
+- **n-gram first, draft model later.** Prompt lookup needs no second model or second KV cache,
+  and it is the case where speculation helps most (copying, extraction, code edits).
+
+## 10. Benchmarks: separate processes, same token ids, staged prefix
+- Each system runs in its own process: vLLM reserves most GPU memory, and torch state
+  must not leak between systems.
+- Prompts are token ids from a fixed seed, so all three systems see identical inputs.
+- **Prefix workload is staged** (1 request, then 63) for every system. Admitted together,
+  identical prefixes cannot hit mini-engine's cache (§4), and a server with a cached
+  system prompt is the realistic case. A CPU smoke test showed 0 cached tokens before
+  this change.
+- **Throughput runs force output length** (`ignore_eos` / HF `min_new_tokens`) and make no
+  correctness claim: the two options differ at EOS (§11).
+
+## 11. GPU parity is checked with natural EOS stopping
+The first GPU parity check forced 48 tokens on both sides and matched HF on 3/8 prompts in
+fp32. `benchmarks/gpu_divergence.py` showed this was the comparison, not the engine: HF
+`sdpa` vs `eager` agree 8/8, and at each divergence HF's own full forward ranks the engine's
+token first by 3-12 logits. HF `min_new_tokens` *bans* EOS, while `ignore_eos` lets the engine
+choose EOS and continue, so the runs split exactly where the model ends its answer. With natural
+EOS stopping, parity is 8/8 in fp32 with and without speculation (`benchmarks/results/gpu_parity.md`).
+
 ## Not in scope (yet)
 Top-p/top-k sampling, stop strings, streaming, CUDA graphs, tensor parallelism,
-speculative decoding, an HTTP server. See the README roadmap.
+draft-model speculative decoding, an HTTP server. See the README roadmap.
