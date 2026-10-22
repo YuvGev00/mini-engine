@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,7 +30,9 @@ class EngineConfig:
     dtype: torch.dtype = torch.float32
     seed: int = 0
     speculative: SpeculativeConfig | None = None  # n-gram speculative decoding (greedy requests only)
-    attention_backend: str = "auto"  # "sdpa", "grouped", or "auto" (grouped on CUDA, sdpa elsewhere)
+    attention_backend: str = (
+        "auto"  # "sdpa", "grouped", "triton", or "auto" (triton/grouped on CUDA, else sdpa)
+    )
 
 
 @dataclass
@@ -75,8 +78,11 @@ class LLMEngine:
         self.generator = torch.Generator(device=self.device).manual_seed(config.seed)
         backend = config.attention_backend
         if backend == "auto":
-            backend = "grouped" if self.device.type == "cuda" else "sdpa"
-        if backend not in ("sdpa", "grouped"):
+            if self.device.type != "cuda":
+                backend = "sdpa"
+            else:
+                backend = "triton" if importlib.util.find_spec("triton") else "grouped"
+        if backend not in ("sdpa", "grouped", "triton"):
             raise ValueError(f"unknown attention_backend {config.attention_backend!r}")
         self.attention_backend = backend
         self.stats = EngineStats()
