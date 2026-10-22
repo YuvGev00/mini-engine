@@ -34,7 +34,7 @@ def find(rows: list[dict[str, Any]], system: str, workload: str, **tags: Any) ->
 
 def agreement(a: dict[str, Any] | None, b: dict[str, Any] | None) -> str:
     """Share of the first 4 requests whose first 32 greedy tokens are identical."""
-    if not a or not b:
+    if not a or not b or "outputs_head" not in a or "outputs_head" not in b:
         return "-"
     pairs = list(zip(a["outputs_head"], b["outputs_head"], strict=False))
     same = sum(x == y for x, y in pairs)
