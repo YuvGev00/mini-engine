@@ -6,7 +6,7 @@ speculative decoding. It runs
 Qwen3 (tested on Qwen3-0.6B), and its greedy output is **token-identical to Hugging Face
 `generate`**, both one request at a time and batched.
 
-The core is about 860 lines in `src/mini_engine/`, small enough to read in one sitting.
+The core is about 1,000 lines in `src/mini_engine/`, small enough to read in one sitting.
 
 ```
 sequence.py       request state: tokens, num_computed_tokens, block table
