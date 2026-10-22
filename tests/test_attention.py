@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -10,7 +11,8 @@ from mini_engine.attention import AttentionMetadata, paged_attention
 H, KVH, D, BS, NUM_BLOCKS = 4, 2, 8, 4, 32
 
 
-def test_mixed_prefill_and_decode_matches_dense() -> None:
+@pytest.mark.parametrize("backend", ["sdpa", "grouped"])
+def test_mixed_prefill_and_decode_matches_dense(backend: str) -> None:
     g = torch.Generator().manual_seed(0)
     k_cache = torch.zeros(NUM_BLOCKS, BS, KVH, D)
     v_cache = torch.zeros(NUM_BLOCKS, BS, KVH, D)
@@ -36,6 +38,7 @@ def test_mixed_prefill_and_decode_matches_dense() -> None:
         block_tables=tables,
         block_size=BS,
         device=torch.device("cpu"),
+        backend=backend,
     )
     out = paged_attention(
         torch.cat(qs),

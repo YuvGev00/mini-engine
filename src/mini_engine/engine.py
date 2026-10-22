@@ -29,6 +29,7 @@ class EngineConfig:
     dtype: torch.dtype = torch.float32
     seed: int = 0
     speculative: SpeculativeConfig | None = None  # n-gram speculative decoding (greedy requests only)
+    attention_backend: str = "auto"  # "sdpa", "grouped", or "auto" (grouped on CUDA, sdpa elsewhere)
 
 
 @dataclass
@@ -72,6 +73,12 @@ class LLMEngine:
             for _ in range(mcfg.num_layers)
         ]
         self.generator = torch.Generator(device=self.device).manual_seed(config.seed)
+        backend = config.attention_backend
+        if backend == "auto":
+            backend = "grouped" if self.device.type == "cuda" else "sdpa"
+        if backend not in ("sdpa", "grouped"):
+            raise ValueError(f"unknown attention_backend {config.attention_backend!r}")
+        self.attention_backend = backend
         self.stats = EngineStats()
 
     # ----------------------------------------------------------------- loading
@@ -180,6 +187,7 @@ class LLMEngine:
             block_tables=[item.seq.block_table for item in batch],
             block_size=self.config.block_size,
             device=self.device,
+            backend=self.attention_backend,
         )
 
         def as_tensor(xs: list[int]) -> torch.Tensor:

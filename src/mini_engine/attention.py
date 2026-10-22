@@ -9,6 +9,14 @@ Layouts
 The batch is padded to [B, max_q] queries and [B, max_blocks * block_size] keys. That
 wastes compute on padding (a fused kernel would not), but every step is a single SDPA
 call, and the same code serves prefill, chunked prefill and decode.
+
+Two backends compute the same attention:
+  "sdpa"     one `F.scaled_dot_product_attention` call with `enable_gqa`. With a boolean
+             mask plus GQA, PyTorch has no fused kernel and falls back to its math path,
+             which expands K/V to every query head (repeat_interleave) and is slow on CUDA.
+  "grouped"  folds each KV head's query group into the query-length axis, so one batched
+             matmul per side serves all heads of a group with no K/V expansion. Softmax runs
+             in fp32. This is the default on CUDA; "sdpa" stays the reference elsewhere.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ class AttentionMetadata:
     mask: torch.Tensor  # [B, 1, max_q, max_k] bool, True = may attend
     batch_size: int
     max_q: int
+    backend: str = "sdpa"
 
     @classmethod
     def build(
@@ -36,6 +45,7 @@ class AttentionMetadata:
         block_tables: list[list[int]],
         block_size: int,
         device: torch.device,
+        backend: str = "sdpa",
     ) -> AttentionMetadata:
         """`context_lens[b]` counts cached plus new tokens of sequence b, so its new
         tokens sit at absolute positions [context_len - query_len, context_len)."""
@@ -66,6 +76,7 @@ class AttentionMetadata:
             mask=mask[:, None, :, :],
             batch_size=batch_size,
             max_q=max_q,
+            backend=backend,
         )
 
 
@@ -95,8 +106,25 @@ def paged_attention(
     q_pad[meta.query_index] = q
     q_pad = q_pad.view(b, max_q, num_heads, head_dim).transpose(1, 2)
 
-    out = F.scaled_dot_product_attention(q_pad, keys, values, attn_mask=meta.mask, enable_gqa=True)
+    if meta.backend == "grouped":
+        out = grouped_attention(q_pad, keys, values, meta.mask)
+    else:
+        out = F.scaled_dot_product_attention(q_pad, keys, values, attn_mask=meta.mask, enable_gqa=True)
 
     # 4. Back to the packed token layout.
     out = out.transpose(1, 2).reshape(b * max_q, num_heads, head_dim)
     return out[meta.query_index]
+
+
+def grouped_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """GQA attention without expanding K/V: q [B, h, Q, d], k/v [B, kvh, K, d], mask
+    [B, 1, Q, K] (True = may attend). Query head i uses KV head i // (h // kvh), as in HF."""
+    b, h, q_len, d = q.shape
+    kvh, k_len = k.shape[1], k.shape[2]
+    g = h // kvh
+    qg = q.reshape(b, kvh, g * q_len, d)  # heads of one group are contiguous in h
+    scores = torch.matmul(qg, k.transpose(-1, -2)).float() * (d**-0.5)  # [B, kvh, g*Q, K]
+    group_mask = mask.expand(b, 1, q_len, k_len).repeat(1, 1, g, 1)  # [B, 1, g*Q, K]
+    scores = scores.masked_fill(~group_mask, float("-inf"))
+    probs = torch.softmax(scores, dim=-1).to(v.dtype)
+    return torch.matmul(probs, v).reshape(b, h, q_len, d)
