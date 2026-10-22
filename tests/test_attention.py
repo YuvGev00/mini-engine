@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -10,10 +11,11 @@ from mini_engine.attention import AttentionMetadata, paged_attention
 H, KVH, D, BS, NUM_BLOCKS = 4, 2, 8, 4, 32
 
 
-def test_mixed_prefill_and_decode_matches_dense() -> None:
+@pytest.mark.parametrize("backend", ["sdpa", "grouped"])
+def test_mixed_prefill_and_decode_matches_dense(backend: str) -> None:
     g = torch.Generator().manual_seed(0)
-    k_cache = torch.zeros(NUM_BLOCKS, BS, KVH, D)
-    v_cache = torch.zeros(NUM_BLOCKS, BS, KVH, D)
+    k_cache = torch.zeros(KVH, NUM_BLOCKS, BS, D)
+    v_cache = torch.zeros(KVH, NUM_BLOCKS, BS, D)
     # (cached tokens, new tokens): fresh prefill, decode, chunked prefill continuation.
     shapes = [(0, 7), (9, 1), (8, 5)]
     # Scattered, non-contiguous block tables on purpose.
@@ -26,8 +28,8 @@ def test_mixed_prefill_and_decode_matches_dense() -> None:
         full_v.append(torch.randn(cached + new, KVH, D, generator=g))
         for pos in range(cached):  # pretend earlier steps wrote the cached part
             b = tables[-1][pos // BS]
-            k_cache[b, pos % BS] = full_k[-1][pos]
-            v_cache[b, pos % BS] = full_v[-1][pos]
+            k_cache[:, b, pos % BS] = full_k[-1][pos]
+            v_cache[:, b, pos % BS] = full_v[-1][pos]
 
     qs = [torch.randn(new, H, D, generator=g) for _, new in shapes]
     meta = AttentionMetadata.build(
@@ -36,6 +38,7 @@ def test_mixed_prefill_and_decode_matches_dense() -> None:
         block_tables=tables,
         block_size=BS,
         device=torch.device("cpu"),
+        backend=backend,
     )
     out = paged_attention(
         torch.cat(qs),
@@ -58,4 +61,4 @@ def test_mixed_prefill_and_decode_matches_dense() -> None:
     # The new tokens' K/V were written to the right slots.
     c, n = shapes[2]
     for pos in range(c, c + n):
-        torch.testing.assert_close(k_cache[tables[2][pos // BS], pos % BS], full_k[2][pos])
+        torch.testing.assert_close(k_cache[:, tables[2][pos // BS], pos % BS], full_k[2][pos])

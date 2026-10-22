@@ -38,9 +38,13 @@ python_version = "3.12"
 mypy_path = "tests"
 
 [[tool.mypy.overrides]]
-module = ["transformers.*", "safetensors.*", "huggingface_hub.*"]
+module = ["transformers.*", "safetensors.*", "huggingface_hub.*", "triton.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+module = ["mini_engine.triton_attention"]
+disallow_untyped_decorators = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

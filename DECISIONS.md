@@ -3,7 +3,8 @@
 The reference design is [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm). Where
 mini-engine differs, it is because of one of two constraints: it has to run on an M2 Mac
 (MPS/CPU, so no flash-attn, Triton or CUDA graphs), and every line has to be explainable
-in an interview. Speed is milestone M5's job.
+in an interview. The CUDA fast path (#12) is an addition on top: every CPU path still runs,
+and the GPU path is tested against it.
 
 ## 1. Attention: gather + one padded SDPA call, no custom kernels
 nano-vllm uses flash-attn varlen kernels for prefill, a paged decode kernel and a Triton
@@ -17,6 +18,11 @@ padded to `[B, max_q, max_ctx]` with a boolean causal-plus-length mask.
   makes mixed batches (#2) and chunked prefill (#3) almost free. It is also trivially
   correct to compare against a dense reference (`test_attention.py`).
 - Padded query rows always see key 0, so SDPA never returns NaN; those rows are dropped.
+- *Later:* on CUDA, SDPA with a boolean mask and GQA has no fused kernel and falls back to
+  its math path, which copies K/V once per query head. The "grouped" backend folds each KV
+  head's query group into the query axis and uses two batched matmuls instead (3× faster
+  per decode step). The KV cache is stored head-major (`[kvh, blocks, block_size, d]`) so
+  the gather lands directly in the layout those matmuls want, with no transpose copy.
 
 ## 2. One unified step instead of separate prefill and decode steps
 nano-vllm schedules either a prefill batch or a decode batch in each step. Here a
@@ -118,6 +124,33 @@ token first by 3-12 logits. HF `min_new_tokens` *bans* EOS, while `ignore_eos` l
 choose EOS and continue, so the runs split exactly where the model ends its answer. With natural
 EOS stopping, parity is 8/8 in fp32 with and without speculation (`benchmarks/results/gpu_parity.md`).
 
+## 12. CUDA fast path: Triton kernels and CUDA graphs for decode and verify steps
+Profiling the decode step on an L4 (`benchmarks/profile_engine.py`) showed two walls in turn.
+First, memory: gathering every context into a padded tensor already ran at memory bandwidth,
+then the matmuls read it again. A Triton kernel (`triton_attention.py`) now walks the block
+table itself, one program per (sequence, KV head), with an online softmax, so each step
+reads the cache once and writes nothing. Second, launches: the GPU then finished its work in
+half the step while the CPU issued ~1,600 kernel launches. The decode forward is captured as
+a CUDA graph per batch-size bucket (1, 2, 4, 8, then every 16) at engine start and replayed.
+- *Scope:* steps where every sequence has at most 8 new tokens use the kernels: one token
+  (decode) goes to the decode kernel, more (speculative verify, short chunks) to a
+  multi-query kernel that puts [query tokens x group heads] on the rows of a `tl.dot`, with
+  a causal mask inside the new tokens. Two graph sets are captured: query length 1, and
+  k + 1 when speculation is on, with tokens laid out padded so one graph fits any mix of
+  draft lengths. Longer prefill chunks stay on the eager grouped path. Before the verify
+  graphs existed, speculation was slower than graph-replayed plain decoding, which is the
+  reason the second set exists.
+- *Padding:* a batch is padded up to its bucket. Padded rows and tokens write K/V to one spare cache
+  block that the block manager never hands out, attend only to that slot, and are dropped.
+- *A bug worth remembering:* a graph records raw addresses. The first version kept one input
+  (`logits_index`) in a local variable; after capture its memory was reused and replays read
+  garbage indices (a device-side assert). Every tensor a graph reads now lives on the object.
+- *Tests:* both kernels are compared with the PyTorch path in fp32 and bf16, and graph
+  decoding (plain and speculative) with eager decoding token for token (`tests/test_gpu.py`,
+  skipped without CUDA). `tests/test_step_graphs.py` runs the same graph bookkeeping on CPU
+  in CI, with capture faked and the kernels replaced by a dense reference. End to end,
+  `gpu_parity.py` still gives 8/8 against HF in fp32.
+
 ## Not in scope (yet)
-Top-p/top-k sampling, stop strings, streaming, CUDA graphs, tensor parallelism,
+Top-p/top-k sampling, stop strings, streaming, tensor parallelism,
 draft-model speculative decoding, an HTTP server. See the README roadmap.
