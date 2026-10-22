@@ -32,15 +32,6 @@ def find(rows: list[dict[str, Any]], system: str, workload: str, **tags: Any) ->
     return None
 
 
-def agreement(a: dict[str, Any] | None, b: dict[str, Any] | None) -> str:
-    """Share of the first 4 requests whose first 32 greedy tokens are identical."""
-    if not a or not b or "outputs_head" not in a or "outputs_head" not in b:
-        return "-"
-    pairs = list(zip(a["outputs_head"], b["outputs_head"], strict=False))
-    same = sum(x == y for x, y in pairs)
-    return f"{same}/{len(pairs)}"
-
-
 def tps(r: dict[str, Any] | None) -> str:
     return "-" if not r or "output_tok_per_s" not in r else f"{r['output_tok_per_s']:,.0f}"
 
@@ -97,10 +88,7 @@ def main(folder: Path) -> None:
         print(f"| vLLM, {label} | {tps(v_off)} | {tps(v_on)} | {ratio(v_on, v_off)} | - |")
     print()
 
-    print("Greedy agreement on the throughput workload (first 32 tokens of 4 requests):")
-    t_mini, t_hf, t_vl = (find(rows, s, "throughput") for s in ("mini", "hf", "vllm"))
-    pairs = {"mini vs HF": (t_mini, t_hf), "mini vs vLLM": (t_mini, t_vl), "HF vs vLLM": (t_hf, t_vl)}
-    print(", ".join(f"{k} {agreement(a, b)}" for k, (a, b) in pairs.items()))
+    print("Correctness (natural EOS stopping) is checked by gpu_parity.py: see results/gpu_parity.md.")
     for r in rows:
         if "error" in r:
             print(f"\nnote: {r['system']} {r['workload']}: {r['error']}")
