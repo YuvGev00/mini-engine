@@ -15,8 +15,8 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run ruff format --check src tests examples
-      - run: uv run ruff check src tests examples
+      - run: uv run ruff format --check src tests examples benchmarks
+      - run: uv run ruff check src tests examples benchmarks
       - run: uv run mypy src tests
       # CPU only, tiny random Qwen3: no model download. The Qwen3-0.6B parity test is
       # opt-in locally via MINI_ENGINE_REAL_MODEL=1.
