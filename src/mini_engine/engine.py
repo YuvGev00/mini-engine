@@ -64,7 +64,7 @@ class LLMEngine:
             self.block_manager,
             set(eos_token_ids),
         )
-        shape = (config.num_blocks, config.block_size, mcfg.num_kv_heads, mcfg.head_dim)
+        shape = (mcfg.num_kv_heads, config.num_blocks, config.block_size, mcfg.head_dim)
         self.kv_caches = [
             (
                 torch.zeros(shape, dtype=config.dtype, device=self.device),
