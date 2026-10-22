@@ -14,6 +14,7 @@ from mini_engine.block_manager import BlockManager
 from mini_engine.model import ModelConfig, Qwen3ForCausalLM
 from mini_engine.scheduler import ScheduledSeq, Scheduler, SchedulerConfig
 from mini_engine.sequence import SamplingParams, Sequence
+from mini_engine.speculative import SpeculativeConfig, propose_ngram, verify_greedy
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,7 @@ class EngineConfig:
     device: str = "cpu"
     dtype: torch.dtype = torch.float32
     seed: int = 0
+    speculative: SpeculativeConfig | None = None  # n-gram speculative decoding (greedy requests only)
 
 
 @dataclass
@@ -36,6 +38,12 @@ class EngineStats:
     computed_tokens: int = 0  # tokens actually run through the model
     generated_tokens: int = 0
     step_batch_sizes: list[int] = field(default_factory=list)
+    draft_tokens: int = 0  # speculative drafts sent to the model
+    accepted_tokens: int = 0  # drafts that matched the model's own greedy choice
+
+    @property
+    def acceptance_rate(self) -> float:
+        return self.accepted_tokens / self.draft_tokens if self.draft_tokens else 0.0
 
 
 def kv_cache_bytes_per_token(cfg: ModelConfig, dtype: torch.dtype) -> int:
@@ -116,24 +124,44 @@ class LLMEngine:
 
     @torch.inference_mode()
     def step(self) -> list[Sequence]:
+        drafts = self._append_drafts()
         batch = self.scheduler.schedule()
         if not batch:
             raise RuntimeError("scheduler produced an empty batch with work pending")
-        input_ids, positions, meta, logits_index = self._prepare(batch)
-        logits = self.model(input_ids, positions, self.kv_caches, meta, logits_index)
-        sampled = self._sample(logits, [item for item in batch if item.samples]).tolist()
+        scheduled = {item.seq.seq_id for item in batch}
+        for seq_id, (seq, draft) in list(drafts.items()):
+            if seq_id not in scheduled:  # preempted or out of budget: drop its drafts
+                del seq.token_ids[-len(draft) :]
+                del drafts[seq_id]
 
-        next_tokens: list[int | None] = []
-        it = iter(sampled)
+        input_ids, positions, meta, logits_index = self._prepare(batch, drafts)
+        logits = self.model(input_ids, positions, self.kv_caches, meta, logits_index)
+
+        plain = [item for item in batch if item.seq.seq_id not in drafts]
+        rows = iter(range(logits.shape[0]))
+        plain_rows: list[int] = []
+        spec_rows: dict[int, list[int]] = {}
         for item in batch:
-            next_tokens.append(next(it) if item.samples else None)
+            if item.seq.seq_id in drafts:
+                spec_rows[item.seq.seq_id] = [next(rows) for _ in range(item.num_tokens)]
+            elif item.samples:
+                plain_rows.append(next(rows))
+        sampled = self._sample(logits[plain_rows], [item for item in plain if item.samples]).tolist()
+        it = iter(sampled)
+        next_tokens = [next(it) if item.samples else None for item in plain]
         self._update_stats(batch)
-        return self.scheduler.postprocess(batch, next_tokens)
+        finished = self.scheduler.postprocess(plain, next_tokens)
+
+        for seq_id, row_ids in spec_rows.items():
+            item = next(i for i in batch if i.seq.seq_id == seq_id)
+            if self._finish_speculative(item, drafts[seq_id][1], logits[row_ids]):
+                finished.append(item.seq)
+        return finished
 
     # ---------------------------------------------------------------- private
 
     def _prepare(
-        self, batch: list[ScheduledSeq]
+        self, batch: list[ScheduledSeq], drafts: dict[int, tuple[Sequence, list[int]]] | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, AttentionMetadata, torch.Tensor]:
         input_ids: list[int] = []
         positions: list[int] = []
@@ -142,7 +170,9 @@ class LLMEngine:
             start = item.seq.num_computed_tokens
             input_ids.extend(item.seq.token_ids[start : start + item.num_tokens])
             positions.extend(range(start, start + item.num_tokens))
-            if item.samples:
+            if drafts and item.seq.seq_id in drafts:  # verify: logits at every computed position
+                logits_index.extend(range(len(input_ids) - item.num_tokens, len(input_ids)))
+            elif item.samples:
                 logits_index.append(len(input_ids) - 1)
         meta = AttentionMetadata.build(
             query_lens=[item.num_tokens for item in batch],
@@ -156,6 +186,44 @@ class LLMEngine:
             return torch.tensor(xs, dtype=torch.int64, device=self.device)
 
         return as_tensor(input_ids), as_tensor(positions), meta, as_tensor(logits_index)
+
+    def _append_drafts(self) -> dict[int, tuple[Sequence, list[int]]]:
+        """Propose n-gram drafts for greedy decoding sequences and append them, so the
+        scheduler treats them as tokens still to compute (like a short prefill chunk)."""
+        spec = self.config.speculative
+        drafts: dict[int, tuple[Sequence, list[int]]] = {}
+        if spec is None:
+            return drafts
+        for seq in self.scheduler.running:
+            if seq.num_uncomputed_tokens != 1 or seq.params.temperature != 0:
+                continue
+            # Never let the drafts push the sequence past its own token limits.
+            room = min(
+                seq.num_prompt_tokens + seq.params.max_tokens - len(seq) - 1,
+                self.config.max_model_len - len(seq) - 1,
+            )
+            k = min(spec.num_speculative_tokens, room)
+            if k < 1:
+                continue
+            draft = propose_ngram(seq.token_ids, k, spec.ngram_max, spec.ngram_min)
+            if draft:
+                seq.token_ids.extend(draft)
+                drafts[seq.seq_id] = (seq, draft)
+        return drafts
+
+    def _finish_speculative(self, item: ScheduledSeq, draft: list[int], logits: torch.Tensor) -> bool:
+        """Accept the drafts that match the model's greedy choices. Row j of `logits` is
+        the prediction after computed position j; position 0 is the real last token."""
+        seq = item.seq
+        del seq.token_ids[-len(draft) :]
+        num_real = len(seq)
+        new_tokens, accepted = verify_greedy(draft, logits.argmax(dim=-1).tolist())
+        self.stats.draft_tokens += min(len(draft), item.num_tokens)
+        self.stats.accepted_tokens += accepted
+        self.stats.generated_tokens += len(new_tokens) - 1  # _update_stats counted one
+        # K/V is valid for the real last token plus the accepted drafts that were computed.
+        num_valid = num_real - 1 + min(accepted + 1, item.num_tokens)
+        return self.scheduler.accept_speculative(seq, num_valid, new_tokens)
 
     def _sample(self, logits: torch.Tensor, items: list[ScheduledSeq]) -> torch.Tensor:
         if not items:
@@ -174,7 +242,7 @@ class LLMEngine:
         s.step_batch_sizes.append(len(batch))
         for item in batch:
             s.computed_tokens += item.num_tokens
-            s.generated_tokens += int(item.samples)
+            s.generated_tokens += int(item.samples)  # speculative steps add the rest later
 
 
 def _as_id_list(eos: Any) -> list[int]:

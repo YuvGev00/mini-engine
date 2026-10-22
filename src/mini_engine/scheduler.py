@@ -122,6 +122,26 @@ class Scheduler:
                 finished.append(seq)
         return finished
 
+    def accept_speculative(self, seq: Sequence, num_valid_computed: int, new_tokens: list[int]) -> bool:
+        """Finish a speculative step for `seq`, whose drafts were already stripped from
+        `token_ids`. `num_valid_computed` counts the tokens whose K/V is in the cache and
+        belongs to the final sequence (rejected drafts' K/V is simply overwritten later).
+        Appends `new_tokens` up to EOS / max_tokens. Returns True if the sequence finished."""
+        finished = False
+        for token in new_tokens:
+            seq.token_ids.append(token)
+            if self._is_done(seq, token):
+                finished = True
+                break
+        # Never claim K/V past the last kept token (EOS can cut accepted tokens short).
+        seq.num_computed_tokens = min(num_valid_computed, len(seq) - 1)
+        self.bm.register_computed_blocks(seq)
+        if finished:
+            seq.status = SequenceStatus.FINISHED
+            self.bm.free(seq)
+            self.running.remove(seq)
+        return finished
+
     def _is_done(self, seq: Sequence, token: int) -> bool:
         if not seq.params.ignore_eos and token in self.eos_token_ids:
             return True
